@@ -6,15 +6,58 @@
 from __future__ import annotations
 
 import re
-from typing import Dict, List, Tuple
+from typing import Dict, Iterable, List, Optional, Tuple
 
 from .models.query import IntentType, Metric, QueryIntent
 
 
+class MetricUnavailableError(ValueError):
+    """问的指标在这份数据里没有对应字段。"""
+
+
 class QueryParser:
-    """把中文问题解析成可翻译成 SQL 的结构化意图。"""
+    """把中文问题解析成可翻译成 SQL 的结构化意图。
+
+    products / available_metrics 在载入数据后由 InsightAgent 注入：
+    问"哪个产品最高"查的是你数据里的产品，而不是写死的 demo 名单。
+    没注入时退回内置默认值，保证 parser 可以独立使用。
+    """
 
     PRODUCTS: Tuple[str, ...] = ("智能手表", "蓝牙耳机", "运动手环")
+
+    METRIC_LABEL_CN = {
+        Metric.REVENUE: "销售额",
+        Metric.UNITS_SOLD: "销量",
+        Metric.VISITORS: "访客数",
+        Metric.CONVERSION_RATE: "转化率",
+    }
+
+    def __init__(
+        self,
+        products: Optional[Iterable[str]] = None,
+        available_metrics: Optional[Iterable[Metric]] = None,
+    ):
+        self.products: Tuple[str, ...] = tuple(products) if products else self.PRODUCTS
+        self.available_metrics: Optional[frozenset] = (
+            frozenset(available_metrics) if available_metrics else None
+        )
+
+    def update_schema(
+        self,
+        products: Optional[Iterable[str]] = None,
+        metrics: Optional[Iterable[Metric]] = None,
+    ) -> "QueryParser":
+        """按数据实际内容刷新可识别的产品名与可用指标。"""
+        if products is not None:
+            cleaned = tuple(str(p).strip() for p in products if str(p).strip())
+            if cleaned:
+                self.products = cleaned
+        if metrics is not None:
+            self.available_metrics = frozenset(metrics)
+        return self
+
+    def known_products(self) -> Tuple[str, ...]:
+        return self.products
 
     # 指标关键词。顺序敏感：转化率必须先于"销量"判断，避免"转化销量"这类表述误判。
     METRIC_KEYWORDS: Tuple[Tuple[Metric, Tuple[str, ...]], ...] = (
@@ -69,15 +112,36 @@ class QueryParser:
         return IntentType.UNKNOWN
 
     def _detect_metric(self, text: str) -> Metric:
+        blocked: Optional[str] = None
         for metric, keywords in self.METRIC_KEYWORDS:
-            if any(kw in text for kw in keywords):
-                return metric
-        return Metric.REVENUE  # 未指明指标时，默认看销售额
+            hit = next((kw for kw in keywords if kw in text), None)
+            if hit is None:
+                continue
+            if self.available_metrics is not None and metric not in self.available_metrics:
+                # 这个词命中了一个这份数据没有的指标：先记住，看后面有没有可用的
+                blocked = blocked or hit
+                continue
+            return metric
+
+        if blocked is not None:
+            available = sorted(self.available_metrics or (), key=lambda m: m.value)
+            names = "、".join(self.METRIC_LABEL_CN.get(m, m.value) for m in available)
+            raise MetricUnavailableError(
+                f"这份数据里没有「{blocked}」对应的字段，现在能分析的是：{names}。"
+            )
+        return self._default_metric()
+
+    def _default_metric(self) -> Metric:
+        """没指明指标时的默认值：优先销售额，没有就用剩下的第一个。"""
+        if self.available_metrics is None or Metric.REVENUE in self.available_metrics:
+            return Metric.REVENUE
+        return sorted(self.available_metrics, key=lambda m: m.value)[0]
 
     def _extract_filters(self, text: str) -> Dict[str, object]:
         filters: Dict[str, object] = {}
-        for product in self.PRODUCTS:
-            if product in text:
+        # 长名字优先，避免"华为"抢走"华为GT5"
+        for product in sorted(self.products, key=len, reverse=True):
+            if product and product in text:
                 filters["product"] = product
                 break
 
