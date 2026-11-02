@@ -4,6 +4,7 @@
 > 全程不调用任何大模型，纯规则引擎 —— 因为数据分析场景里，"猜错"比"查不出"的代价高得多。
 
 演示数据：某品牌三款可穿戴设备（智能手表 / 蓝牙耳机 / 运动手环）2025 年全年逐月销售表，共 36 行。
+**换自己的数据不用改代码也不用改列名** —— 中英文列名自动归一化，分类名和可用指标从数据里现读，见[第四节](#换自己的数据列名不用改)。
 
 ```
 $ python run_demo.py
@@ -40,6 +41,9 @@ InsightAgent 把这条链路压成一次提问，同时保留两样东西：
 
 ```mermaid
 flowchart LR
+    F["CSV / Excel<br/>中英文列名均可"] --> L["loader.py<br/>列名归一化 + 清洗"]
+    L -->|"sales 表"| S
+    L -->|"schema<br/>分类值 / 可用指标"| P
     Q["中文问题<br/>「智能手表转化率变化」"] --> P["parser.py<br/>QueryParser"]
     P -->|QueryIntent<br/>intent/metric/filters| T["translator.py<br/>SQLTranslator"]
     T -->|"SELECT ... （模板生成）"| E["executor.py<br/>SafeQueryExecutor"]
@@ -55,14 +59,15 @@ flowchart LR
 
 | 层 | 文件 | 职责 | 关键设计 |
 |---|---|---|---|
+| 数据接入层 | `src/loader.py` | CSV/Excel → 分析库 | 别名表归一化列名（精确 → 最长包含），必需列只留「时间/分类/金额」三列 |
 | 模型层 | `src/models/query.py`、`result.py` | `QueryIntent` / `QueryResult` / `Insight` | Pydantic 校验，层与层之间只传模型不传裸 dict |
-| 解析层 | `src/parser.py` | 中文 → 结构化意图 | 关键词规则，顺序敏感（异常 > 对比 > 排名 > 趋势 > 汇总） |
+| 解析层 | `src/parser.py` | 中文 → 结构化意图 | 关键词规则，顺序敏感（异常 > 对比 > 排名 > 趋势 > 汇总）；分类值与可用指标由 loader 注入 |
 | 翻译层 | `src/translator.py` | 意图 → SQL | 模板固定，表名列名写死，不接受外部拼接 |
 | 执行层 | `src/executor.py` | 安全执行 SQL | 只读连接 + 单条 SELECT + 关键字黑名单 + 表白名单 + 行数上限 |
 | 分析层 | `src/analyzer.py` | 结果 → 业务结论 | 环比计算、30% 异常阈值分级、指标格式化（¥ / %） |
 | 可视化层 | `src/visualizer.py` | 结果 → 图表 | 函数式返回 `Figure`，不依赖 pyplot 全局状态，Agg 后端可跑 CI |
-| 编排层 | `src/agent.py` | 串起上面五层 | `agent.explore(question)` 一次返回意图 / SQL / 结果 / 结论 |
-| 界面层 | `src/app.py` | Streamlit 交互 | 上传 CSV/Excel、示例问题、表格 + 结论 + 图 |
+| 编排层 | `src/agent.py` | 串起上面各层 | `agent.explore(question)` 一次返回意图 / SQL / 结果 / 结论；`agent.schema` 汇报识别结果 |
+| 界面层 | `src/app.py` | Streamlit 交互 | 上传 CSV/Excel、识别结果回显、示例问题随数据生成、表格 + 结论 + 图 |
 
 ## 三、SQL 安全是怎么做的
 
@@ -91,10 +96,10 @@ uri = "file:" + db_path + "?mode=ro"
 cd insightagent
 python -m pip install -r requirements.txt
 
-# 1) 跑测试（31 个用例）
+# 1) 跑测试（44 个用例）
 python -m pytest tests/ -v
 
-# 2) 跑 Demo（5 个问题 + 关键指标自动校验）
+# 2) 跑 Demo（5 个问题 + 关键指标自动校验 + 换数据附加演示）
 python run_demo.py
 
 # 3) 起交互界面
@@ -110,9 +115,34 @@ streamlit run src/app.py
     智能手表转化率环比  : -55.3%  ✓
 ```
 
-### 换自己的数据
+### 换自己的数据（列名不用改）
 
-CSV / Excel 必需列：`month, product, units_sold, unit_price, revenue, visitors, conversions`。
+把 CSV / Excel 拖进界面，或者 `agent.load("你的文件.csv")` 即可。列名会按别名表自动归一化：
+
+| 你表里的列 | 识别为 | 说明 |
+|---|---|---|
+| `月份` `日期` `date` `period` | `month` | **必需**。`2026年1月` / `2026/01` / `2026-01-15` / `202601` 统一成 `2026-01` |
+| `产品` `商品` `店铺` `门店` `sku` `category` | `product` | **必需**。问答里的分类维度就用你表里这个词 |
+| `销售额` `销售金额` `收入` `gmv` `turnover` | `revenue` | **必需** |
+| `销量` `数量` `件数` `qty` | `units_sold` | 可选 |
+| `访客数` `访问量` `浏览量` `uv` | `visitors` | 可选 |
+| `成交数` `订单数` `下单数` | `conversions` | 可选，与 `visitors` 齐备即可回算转化率 |
+
+**只有三列是必需的**（时间 / 分类 / 金额），其余缺了只是少一个可问的角度。硬问没有的指标会明确拒绝并列出可用项，而不是给个数糊过去：
+
+```
+这份数据里没有「销量」对应的字段，现在能分析的是：销售额。
+```
+
+分类名（产品名 / 店铺名）和可用指标**都是从数据里现读的**，所以 `哪个店铺销售额最高`、`北京旗舰店销售额环比变化` 都能直接问 —— 不需要改代码。
+
+实在对不上会报错，并把识别结果一起吐出来：
+
+```
+缺少必需列：['product', 'revenue']。需要「时间 / 分类 / 金额」三类字段，
+你这份数据的列是 ['时间', '备注', '备注2']，已识别 {'时间': 'month'}。
+```
+
 `conversion_rate` 可以不给，会自动按 `conversions / visitors * 100` 回算。清洗规则是"脏行直接丢弃"
 而不是猜一个值填回去 —— 分析场景里，静默填补比少一行数据更危险。
 
@@ -120,10 +150,13 @@ CSV / Excel 必需列：`month, product, units_sold, unit_price, revenue, visito
 from src.agent import InsightAgent
 
 agent = InsightAgent(db_path="my.db", dataset_path="my_sales.xlsx")
-out = agent.explore("蓝牙耳机近半年销售额趋势")
-print(out["sql"])             # 可审计的 SQL
-print(out["insight"].summary) # 一句业务结论
+print(agent.schema)            # 识别到的分类值、可用指标、列名映射
+out = agent.explore("北京旗舰店近半年销售额趋势")
+print(out["sql"])              # 可审计的 SQL
+print(out["insight"].summary)  # 一句业务结论
 ```
+
+`run_demo.py` 末尾附了一段「换一份中文列名的门店数据」的演示，跑一遍就能看到映射结果和真实结论。
 
 ## 五、演示数据的结论
 
@@ -152,18 +185,26 @@ LLM 更合适的位置是**意图消歧**——当规则命中 UNKNOWN 时兜底
 **Q4：环比 -59.9% 为什么判定为 critical？**
 阈值定在 30%（`ANOMALY_THRESHOLD`）。超过这个量级的月度波动，在真实业务里通常不是"正常波动"，而是活动结束、断货、价格调整或埋点故障。分级不是为了好看，是为了让结论有**行动指向**：critical 会额外插一条"建议排查活动结束、断货或埋点异常"。
 
-**Q5：31 个测试是怎么分的？**
-解析 6 + 翻译 7 + 执行 8 + 清洗 3 + 分析 4 + 可视化 1 + 集成 2。重点在**边界**而不是happy path：`INSERT`/`DROP` 必须被拒、多语句必须被拒、`limit` 必须能截断、脏行必须被丢、环比方向必须判断正确。集成测试走真实 SQLite 全链路，确认各层拼起来没有语义漂移。
+**Q5：44 个测试是怎么分的？**
+解析 6 + 翻译 7 + 执行 8 + 清洗 3 + 列名映射 7 + 动态 schema 5 + 分析 4 + 可视化 1 + 集成 3。重点在**边界**而不是 happy path：`INSERT`/`DROP` 必须被拒、多语句必须被拒、`limit` 必须能截断、脏行必须被丢、环比方向必须判断正确、"退款金额"不能被当成销售额、问不存在的指标必须被拒绝。集成测试走真实 SQLite 全链路，确认各层拼起来没有语义漂移。
 
 **Q6：Streamlit 缓存为什么用「路径 + mtime」做 key？**
 只按路径缓存，用户换了同名文件内容不刷新，会拿着旧结果骗人；只用 mtime，同一次会话里多次 rerun 又会重复建库。两个拼起来既能在换文件时重建，又能在同一文件上复用。
 
+**Q7：列名自动识别，为什么不用 fuzzy matching 或者让 LLM 直接猜？**
+因为猜错的代价不对称。列名错一个，整份分析的数字就全错，而且**看起来完全正常**——这是最难排查的一类 bug。
+
+这不是假设。改造前的版本里，产品名是写死的三个，问一个不在名单里的产品（比如"华为GT5销售额环比变化"）时，过滤条件会被静默丢掉，结果把两个产品的合计当成了单个产品的销售额，报出一个看着很合理的 **-43.6%**（正确值是 **-45.5%**）。报错能被发现，静默算错不能。
+
+所以这里做的是**别名表 + 两级匹配**（精确匹配 → 最长别名包含匹配，且"退款金额"这类负面词排除在外），全程确定性、可复现；匹配不上就抛错，把可用列名和已识别结果一起吐出来，让人去改列名。**宁可拒绝，不可静默出错。**
+
 ## 七、已知限制
 
-- 产品名、指标、意图都是**关键词白名单**，不支持任意维度自由组合（如"按城市看"）。要扩展得改 `parser.py` 的三张表。
+- 分类维度固定挂在 `product` 列上，不支持多维度自由组合（如"按城市 × 品类"交叉看）。要扩展得改 `translator.py` 的模板。
+- 意图仍走关键词白名单，问法太绕（如"帮我看看最近这波为啥掉了"）会落到 `UNKNOWN` 被拒。这是刻意的：宁可拒答也不硬猜一个近似意图。
 - 环比只做相邻两期，同比需要补去年同期对齐逻辑。
 - 只支持单表 `sales`，多表 join 需要扩展 `ALLOWED_TABLES` 与 translator 模板。
-- 时间列按字符串 `YYYY-MM` 排序，跨年格式不一致（如 `2025-1`）会排错，清洗层目前不纠这个。
+- 时间列只认能解析成 `YYYY-MM` 的写法。`Q1`、不带年份的 `1月` 会按字符串原样排序，跨年时可能排错。
 
 ## 八、目录
 
@@ -171,19 +212,20 @@ LLM 更合适的位置是**意图消歧**——当规则命中 UNKNOWN 时兜底
 insightagent/
 ├── README.md
 ├── requirements.txt
-├── run_demo.py                  # 5 个问题 + 关键指标自动校验
+├── run_demo.py                  # 5 个问题 + 关键指标校验 + 换数据演示
 ├── demo_data/
 │   ├── generate_demo_data.py    # 演示数据生成脚本（可复现）
-│   └── sales_data.csv           # 36 行，三产品 × 12 月
+│   ├── sales_data.csv           # 36 行，三产品 × 12 月（英文列名）
+│   └── store_sales_cn.csv       # 12 行，两门店 × 6 月（中文列名，用于演示自适应）
 ├── demo_output/                 # 图表产物
 ├── src/
 │   ├── models/{query,result}.py
 │   ├── parser.py  translator.py  executor.py
 │   ├── analyzer.py  visualizer.py
-│   ├── loader.py                # CSV/Excel 读取 + 清洗 + 建库
-│   ├── agent.py                 # 编排
+│   ├── loader.py                # CSV/Excel 读取 + 列名归一化 + 清洗 + 建库
+│   ├── agent.py                 # 编排 + schema 同步（产品名/指标从数据里读）
 │   └── app.py                   # Streamlit
-└── tests/test_insightagent.py   # 31 个用例
+└── tests/test_insightagent.py   # 44 个用例
 ```
 
 ---
