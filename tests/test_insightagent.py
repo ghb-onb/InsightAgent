@@ -1,5 +1,5 @@
-"""InsightAgent test suite - 31 tests across parser / translator / executor /
-loader / analyzer / visualizer / integration."""
+"""InsightAgent test suite - 44 tests across parser / translator / executor /
+loader / column mapping / dynamic schema / analyzer / visualizer / integration."""
 from __future__ import annotations
 
 import os
@@ -14,10 +14,10 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from src.agent import InsightAgent
 from src.analyzer import InsightAnalyzer
 from src.executor import SafeQueryExecutor, UnsafeQueryError
-from src.loader import build_database, clean_dataset, read_dataset
+from src.loader import build_database, clean_dataset, map_columns, read_dataset
 from src.models.query import IntentType, Metric, QueryIntent
 from src.models.result import QueryResult
-from src.parser import QueryParser
+from src.parser import MetricUnavailableError, QueryParser
 from src.translator import SQLTranslator, UnsupportedIntentError
 from src.visualizer import ChartBuilder
 
@@ -173,6 +173,105 @@ class TestLoader:
         assert cleaned.loc[0, "conversion_rate"] == pytest.approx(expected, abs=1e-6)
 
 
+# ===== Column mapping tests (7) =====
+class TestColumnMapping:
+    def test_maps_chinese_headers(self):
+        mapping = map_columns(["月份", "产品", "销售额", "销量"])
+        assert mapping["月份"] == "month"
+        assert mapping["产品"] == "product"
+        assert mapping["销售额"] == "revenue"
+        assert mapping["销量"] == "units_sold"
+
+    def test_maps_store_column_as_product_dimension(self):
+        # 门店/店铺 也是合法的分类维度
+        mapping = map_columns(["月份", "店铺", "销售额"])
+        assert mapping["店铺"] == "product"
+
+    def test_skips_negative_columns(self):
+        # "退款金额" 含"金额"，但绝不是销售额，不能占住 revenue
+        mapping = map_columns(["月份", "产品", "退款金额"])
+        assert "revenue" not in mapping.values()
+
+    def test_prefers_longer_alias(self):
+        # 同时有"销售金额"和"金额"时，"销售金额"更该当销售额
+        mapping = map_columns(["月份", "产品", "销售金额", "金额"])
+        assert mapping["销售金额"] == "revenue"
+
+    def test_normalizes_chinese_month(self):
+        frame = clean_dataset(pd.DataFrame({
+            "日期": ["2026年1月", "2026/02", "2026-03-15"],
+            "商品": ["A", "A", "A"],
+            "金额": [100, 200, 300],
+        }))
+        assert list(frame["month"]) == ["2026-01", "2026-02", "2026-03"]
+
+    def test_missing_required_column_raises(self):
+        with pytest.raises(ValueError, match="缺少必需列"):
+            clean_dataset(pd.DataFrame({"时间": ["2026-01"], "备注": ["备注"]}))
+
+    def test_minimal_three_columns_works(self):
+        frame = clean_dataset(pd.DataFrame({
+            "月份": ["2026-01", "2026-02"],
+            "商品": ["A", "A"],
+            "金额": [100, 200],
+        }))
+        assert set(frame.columns) == {"month", "product", "revenue"}
+        # 没有 visitors/conversions 时不该留一列全 NaN 的转化率骗人
+        assert "conversion_rate" not in frame.columns
+
+
+# ===== Dynamic schema tests (5) =====
+class TestDynamicSchema:
+    def test_agent_learns_products_from_data(self, tmp_path):
+        csv = tmp_path / "custom.csv"
+        csv.write_text(
+            "month,product,revenue\n2026-01,华为GT5,100\n2026-02,华为GT5,90\n",
+            encoding="utf-8",
+        )
+        agent_custom = InsightAgent(db_path=tmp_path / "t.db")
+        agent_custom.load(csv)
+        assert "华为GT5" in agent_custom.schema["products"]
+        assert "智能手表" not in agent_custom.schema["products"]
+
+    def test_product_filter_uses_real_product(self, tmp_path):
+        csv = tmp_path / "custom.csv"
+        csv.write_text(
+            "month,product,revenue\n"
+            "2026-02,华为GT5,32890\n2026-03,华为GT5,17940\n"
+            "2026-02,小米手环9,25415\n2026-03,小米手环9,14950\n",
+            encoding="utf-8",
+        )
+        agent_custom = InsightAgent(db_path=tmp_path / "t.db")
+        agent_custom.load(csv)
+        answer = agent_custom.explore("华为GT5销售额环比变化")
+        # 只算华为GT5，不能把两个产品加起来（旧实现会给出 32890 vs 58305）
+        assert answer["insight"].value == pytest.approx(17940)
+        assert answer["insight"].previous == pytest.approx(32890)
+
+    def test_parser_rejects_unavailable_metric(self):
+        parser = QueryParser(products=["A"], available_metrics=[Metric.REVENUE])
+        with pytest.raises(MetricUnavailableError, match="销量"):
+            parser.parse("A的销量趋势")
+
+    def test_longest_product_name_wins(self):
+        parser = QueryParser(products=["华为", "华为GT5"])
+        intent = parser.parse("华为GT5销售额趋势")
+        assert intent.filters.get("product") == "华为GT5"
+
+    def test_schema_reports_available_metrics(self, tmp_path):
+        csv = tmp_path / "custom.csv"
+        csv.write_text(
+            "月份,商品,金额,访客数,成交数\n2026-01,A,100,50,5\n2026-02,A,90,40,4\n",
+            encoding="utf-8",
+        )
+        agent_custom = InsightAgent(db_path=tmp_path / "t.db")
+        agent_custom.load(csv)
+        # 有金额 / 访客 / 成交，转化率可回算；没有销量列，units_sold 不该出现
+        assert set(agent_custom.schema["metrics"]) == {
+            "revenue", "visitors", "conversion_rate",
+        }
+
+
 # ===== Analyzer tests (4) =====
 class TestAnalyzer:
     def test_ranking_picks_top_product(self):
@@ -226,7 +325,7 @@ class TestVisualizer:
             assert len(fig.axes) == 1
 
 
-# ===== Integration tests (2) =====
+# ===== Integration tests (3) =====
 class TestIntegration:
     def test_top_product_end_to_end(self, agent):
         answer = agent.explore("哪个产品销售额最高")
@@ -238,3 +337,24 @@ class TestIntegration:
         answer = agent.explore("智能手表销售额环比变化")
         assert answer["row_count"] == 2
         assert answer["insight"].change_pct == -59.9
+
+    def test_chinese_headers_end_to_end(self, tmp_path):
+        """中文列名 + 非 demo 门店名，从读文件一路到结论全链路。"""
+        csv = tmp_path / "门店销售.csv"
+        csv.write_text(
+            "月份,店铺,销售额,访客数,成交数\n"
+            "2026-01,北京店,1000,100,5\n"
+            "2026-02,北京店,800,100,4\n"
+            "2026-01,上海店,600,80,3\n"
+            "2026-02,上海店,900,80,4\n",
+            encoding="utf-8",
+        )
+        custom = InsightAgent(db_path=tmp_path / "cn.db")
+        custom.load(csv)
+
+        assert custom.schema["products"] == ["上海店", "北京店"]
+
+        answer = custom.explore("北京店销售额环比变化")
+        assert answer["insight"].value == pytest.approx(800)
+        assert answer["insight"].previous == pytest.approx(1000)
+        assert answer["insight"].change_pct == pytest.approx(-20.0)
