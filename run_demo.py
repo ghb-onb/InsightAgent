@@ -17,6 +17,7 @@ from src.visualizer import ChartBuilder
 
 BASE_DIR = Path(__file__).resolve().parent
 DEMO_CSV = BASE_DIR / "demo_data" / "sales_data.csv"
+CUSTOM_CSV = BASE_DIR / "demo_data" / "store_sales_cn.csv"
 OUTPUT_DIR = BASE_DIR / "demo_output"
 
 QUESTIONS = [
@@ -37,6 +38,37 @@ METRIC_LABEL = {
 
 def line(char: str = "=", width: int = 66) -> None:
     print(char * width)
+
+
+def demo_custom_dataset() -> None:
+    """附加演示：换一份"别人家"的表（中文列名、店铺维度）也能直接分析。
+
+    这一段是为了证明解析链没有写死 demo 的产品名和英文列名：
+    列名靠别名表归一化，分类维度和指标全部从数据里现读。
+    """
+    line()
+    print("  附加演示：换成中文列名、店铺维度的另一份数据")
+    line("-")
+
+    agent = InsightAgent(db_path=Path(tempfile.gettempdir()) / "insightagent_demo_cn.db")
+    rows = agent.load(CUSTOM_CSV)
+    schema = agent.schema
+
+    print(f"  数据源: demo_data/{CUSTOM_CSV.name}  ({rows} 行)")
+    print("  列名自动识别:")
+    for source, canonical in schema["mapping"].items():
+        print(f"    {source}  ->  {canonical}")
+    print(f"  分类维度: {schema['dimension_label']} = {schema['products']}")
+    print(f"  可问指标: {schema['metrics']}\n")
+
+    for question in (
+        f"哪个{schema['dimension_label']}销售额最高",
+        f"{schema['products'][0]}销售额环比变化",
+    ):
+        answer = agent.explore(question)
+        print(f"  问：{question}")
+        print(f"      {answer['insight'].summary}")
+        print()
 
 
 def main() -> None:
@@ -107,6 +139,8 @@ def main() -> None:
 
     if db_path.exists():
         db_path.unlink()
+
+    demo_custom_dataset()
 
     print("\n  Demo complete!")
 
