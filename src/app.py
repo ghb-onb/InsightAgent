@@ -1,4 +1,4 @@
-"""Streamlit 交互界面：上传数据 -> 提问 -> 看表 / 看结论 / 看图。
+"""Streamlit 交互界面：上传数据 -> 自动识别列名 -> 提问 -> 看表 / 看结论 / 看图。
 
 启动： streamlit run src/app.py
 """
@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import tempfile
 from pathlib import Path
+from typing import Any, Dict, List
 
 import pandas as pd
 import streamlit as st
@@ -19,20 +20,38 @@ st.set_page_config(page_title="InsightAgent", page_icon="📊", layout="wide")
 
 DEMO_FILE = Path(__file__).resolve().parent.parent / "demo_data" / "sales_data.csv"
 
-SAMPLE_QUESTIONS = [
-    "哪个产品销售额最高",
-    "智能手表销售额环比变化",
-    "智能手表转化率变化",
-    "蓝牙耳机近半年销售额趋势",
-    "三个产品合计销售额是多少",
-]
+METRIC_CN = {
+    "revenue": "销售额",
+    "units_sold": "销量",
+    "visitors": "访客数",
+    "conversion_rate": "转化率",
+}
 
 METRIC_LABEL = {
     "revenue": "销售额",
-    "units_sold": "销量（台）",
+    "units_sold": "销量（件）",
     "visitors": "访客数",
     "conversion_rate": "转化率（%）",
 }
+
+
+def build_sample_questions(schema: Dict[str, Any]) -> List[str]:
+    """按数据的实际情况生成示例问题，不用写死的 demo 问题。"""
+    dimension = schema.get("dimension_label") or "产品"
+    products = schema.get("products") or []
+    metrics = set(schema.get("metrics") or [])
+
+    questions = [f"哪个{dimension}销售额最高"]
+    if products:
+        first = products[0]
+        questions.append(f"{first}销售额环比变化")
+        if "conversion_rate" in metrics:
+            questions.append(f"{first}转化率变化")
+        questions.append(f"{first}近半年销售额趋势")
+    if "units_sold" in metrics:
+        questions.append(f"哪个{dimension}销量最高")
+    questions.append("合计销售额是多少")
+    return questions
 
 
 @st.cache_resource(show_spinner=False)
@@ -48,17 +67,12 @@ def main() -> None:
     st.title("📊 InsightAgent")
     st.caption("上传销售明细，用中文提问，自动生成安全 SQL 并给出结论与图表")
 
+    # ---------------------------------------------------------------- 数据源
     with st.sidebar:
         st.header("数据源")
         uploaded = st.file_uploader("上传 CSV / Excel", type=["csv", "xlsx", "xls"])
         use_demo = st.checkbox("使用内置 Demo 数据（智能手表销售）", value=uploaded is None)
 
-        st.divider()
-        st.header("示例问题")
-        for question in SAMPLE_QUESTIONS:
-            st.caption(f"· {question}")
-
-    # ---------------------------------------------------------------- 数据加载
     if uploaded is not None:
         suffix = Path(uploaded.name).suffix or ".csv"
         tmp = Path(tempfile.gettempdir()) / f"insightagent_upload{suffix}"
@@ -77,12 +91,46 @@ def main() -> None:
         st.error(f"数据加载失败：{exc}")
         return
 
-    st.success(f"已加载 {len(frame)} 行数据 · {frame['product'].nunique()} 个产品")
+    schema = agent.schema
+    samples = build_sample_questions(schema)
+
+    # 示例问题放在数据加载之后生成，才能用上数据里的真实分类名
+    with st.sidebar:
+        st.divider()
+        st.header("示例问题")
+        for question in samples:
+            st.caption(f"· {question}")
+
+    # ------------------------------------------------------------------ 概览
+    st.success(
+        f"已加载 {schema['rows']} 行 · "
+        f"{len(schema['products'])} 个{schema['dimension_label']} · "
+        f"可问指标：{'、'.join(METRIC_CN.get(m, m) for m in schema['metrics'])}"
+    )
+
+    with st.expander("列名识别结果", expanded=False):
+        mapping = schema.get("mapping") or {}
+        if mapping:
+            st.dataframe(
+                pd.DataFrame(
+                    [{"你表里的列": src, "识别为标准字段": dst} for src, dst in mapping.items()]
+                ),
+                use_container_width=True,
+                hide_index=True,
+            )
+        else:
+            st.caption("列名已经是标准字段，不需要映射。")
+        st.caption(
+            f"分类维度：{schema['dimension_label']}"
+            f"（{len(schema['products'])} 个值）　|　"
+            f"清理后保留列：{'、'.join(schema['columns'])}"
+        )
+
     with st.expander("预览清洗后的数据", expanded=False):
         st.dataframe(frame.head(50), use_container_width=True)
 
-    # ------------------------------------------------------------------ 提问区
-    question = st.text_input("你想问什么？", value=SAMPLE_QUESTIONS[0])
+    # ------------------------------------------------------------------ 提问
+    question = st.text_input("你想问什么？", value=samples[0])
     if not question.strip():
         return
 
@@ -110,7 +158,7 @@ def main() -> None:
         change_col.metric("环比", f"{insight.change_pct:+.1f}%")
     row_col.metric("命中行数", answer["row_count"])
 
-    # ------------------------------------------------------------------ 可视化
+    # -------------------------------------------------------------- 可视化
     rows = answer["rows"]
     if rows:
         labels = [str(r[0]) for r in rows]
@@ -124,7 +172,10 @@ def main() -> None:
                 highlight_max=intent.intent is IntentType.RANKING,
             )
         else:
-            fig = builder.line(labels, values, title=question, ylabel=METRIC_LABEL.get(str(intent.metric.value), ""))
+            fig = builder.line(
+                labels, values, title=question,
+                ylabel=METRIC_LABEL.get(str(intent.metric.value), ""),
+            )
 
         st.pyplot(fig)
 
